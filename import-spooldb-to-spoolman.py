@@ -13,9 +13,9 @@ does not export. Sensible defaults are used below (1.75mm diameter, and a
 density looked up by material) and can be edited before running if your own
 filament differs.
 
-Usage:
-	python import-spooldb-to-spoolman.py --url http://192.168.0.50:7912 --file my-spools.json
-	python import-spooldb-to-spoolman.py --url http://192.168.0.50:7912 --file my-spools.json --dry-run
+Usage: (replace URL or __ with your Spoolman link)
+	python import-spooldb-to-spoolman.py --url http://192.168.0.__:7912 --file my-spools.json
+	python import-spooldb-to-spoolman.py --url http://192.168.0.__:7912 --file my-spools.json --dry-run
 
 If --url is left out you will be prompted for it. --dry-run prints what would
 be created without writing anything to Spoolman, which is worth doing first.
