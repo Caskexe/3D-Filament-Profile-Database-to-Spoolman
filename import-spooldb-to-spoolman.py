@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """
+Version 1.1 23 Sep 2026
+
 Import a 3D Filament Profile Database (spooldb) export -- https://3dfilamentprofiles.com -- (my-spools.json) into a Spoolman instance.
 
 Spoolman has three linked entities and this script builds them in order:
@@ -13,7 +15,15 @@ does not export. Sensible defaults are used below (1.75mm diameter, and a
 density looked up by material) and can be edited before running if your own
 filament differs.
 
-Usage: (replace URL or __ with your Spoolman link)
+Duplicate protection:
+	vendors   matched by name, ignoring case and extra spaces
+	filaments matched by vendor, material and name, ignoring case and extra spaces
+	spools    matched by lot number (spooldb short code) or by the spooldb URL
+	          stored in the spool comment
+	export    repeated rows in the spooldb file itself are only imported once
+The script can be rerun as often as needed without creating duplicates.
+
+Usage: (Replace URL with your Spoolman installation)
 	python import-spooldb-to-spoolman.py --url http://192.168.0.__:7912 --file my-spools.json
 	python import-spooldb-to-spoolman.py --url http://192.168.0.__:7912 --file my-spools.json --dry-run
 
@@ -25,6 +35,7 @@ By CASK.exe https://github.com/CASKexe
 
 import argparse
 import json
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -39,10 +50,19 @@ DENSITY_BY_MATERIAL = {
 	"ASA": 1.05,
 	"TPU": 1.21,
 	"NYLON": 1.14,
+	"PA": 1.14,
+	"PA (NYLON)": 1.14,
 	"PC": 1.20,
 }
 DEFAULT_DENSITY = 1.24
 DEFAULT_DIAMETER = 1.75
+
+# direction used for multi-colour filament: "coaxial" suits silk dual/tri-colour,
+# "longitudinal" suits gradient or rainbow spools that change colour along their length
+MULTI_COLOUR_DIRECTION = "coaxial"
+
+# pulls the spooldb URL back out of a spool comment written by this script
+SPOOLDB_URL_PATTERN = re.compile(r"spooldb:\s*(\S+)")
 
 
 def api_request(base_url, method, path, body=None):
@@ -60,25 +80,44 @@ def api_request(base_url, method, path, body=None):
 		raise RuntimeError(f"{method} {path} -> HTTP {e.code}: {detail}") from None
 
 
-def find_vendor(base_url, name):
-	vendors = api_request(base_url, "GET", "/api/v1/vendor")
-	for v in vendors:
-		if v["name"].strip().lower() == name.strip().lower():
-			return v
-	return None
+def norm(text):
+	# case-insensitive, whitespace-collapsed key used for all duplicate matching
+	return " ".join((text or "").split()).lower()
 
 
-def create_vendor(base_url, name):
-	return api_request(base_url, "POST", "/api/v1/vendor", {"name": name})
+def filament_key(vendor_id, material, name):
+	return (vendor_id, norm(material), norm(name))
 
 
-def find_filament(base_url, vendor_id, material, name):
-	filaments = api_request(base_url, "GET", "/api/v1/filament")
+def spool_url_from_comment(comment):
+	match = SPOOLDB_URL_PATTERN.search(comment or "")
+	return match.group(1) if match else None
+
+
+def load_existing(base_url):
+	# read everything already in Spoolman once, rather than querying per item
+	vendors = api_request(base_url, "GET", "/api/v1/vendor") or []
+	filaments = api_request(base_url, "GET", "/api/v1/filament") or []
+	spools = api_request(base_url, "GET", "/api/v1/spool?allow_archived=true") or []
+
+	vendor_ids = {norm(v["name"]): v["id"] for v in vendors}
+
+	filament_ids = {}
 	for f in filaments:
-		same_vendor = f.get("vendor", {}) and f["vendor"].get("id") == vendor_id
-		if same_vendor and f.get("material") == material and f.get("name") == name:
-			return f
-	return None
+		vendor = f.get("vendor") or {}
+		filament_ids[filament_key(vendor.get("id"), f.get("material"), f.get("name"))] = f["id"]
+
+	# a spool counts as existing if either its lot number or its spooldb URL is known
+	lot_nrs = set()
+	spool_urls = set()
+	for s in spools:
+		if s.get("lot_nr"):
+			lot_nrs.add(s["lot_nr"])
+		url = spool_url_from_comment(s.get("comment"))
+		if url:
+			spool_urls.add(url)
+
+	return vendor_ids, filament_ids, lot_nrs, spool_urls
 
 
 def normalise_material(material):
@@ -91,15 +130,26 @@ def density_for(material):
 
 def build_filament_name(row):
 	# spooldb's material_type is closer to a variant name (Basic, Rapid, Matte...)
-	# This will just combine it with colour so the Spoolman filament name stays readable
+	# so combine it with colour to keep the Spoolman filament name readable
 	material_type = (row.get("material_type") or "").strip()
 	colour = (row.get("color") or "").strip()
 	return f"{material_type} {colour}".strip() or colour or "Filament"
 
 
+def apply_colours(filament_body, rgb):
+	# Spoolman accepts either a single colour or a multi-colour set, never both
+	colour_hexes = [c.strip().lstrip("#") for c in (rgb or "").split(",") if c.strip()]
+	if len(colour_hexes) == 1:
+		filament_body["color_hex"] = colour_hexes[0]
+	elif len(colour_hexes) > 1:
+		filament_body["multi_color_hexes"] = ",".join(colour_hexes)
+		filament_body["multi_color_direction"] = MULTI_COLOUR_DIRECTION
+
+
 def build_spool_comment(row):
 	# fold the spooldb-only fields that don't map cleanly onto Spoolman fields
-	# into a comment, rather than dropping them
+	# into a comment, rather than dropping them; the spooldb URL goes last and
+	# doubles as the duplicate check on later runs
 	bits = []
 	if row.get("notes"):
 		bits.append(row["notes"])
@@ -112,6 +162,20 @@ def build_spool_comment(row):
 		bits.append(f"TD value: {row['td_value']}")
 	bits.append(f"spooldb: {row.get('spool_url')}")
 	return " | ".join(bits)
+
+
+def dedupe_rows(rows):
+	# drop repeated rows within the export itself, keyed on URL then short code
+	seen = set()
+	unique = []
+	for row in rows:
+		key = row.get("spool_url") or row.get("short_code")
+		if key and key in seen:
+			continue
+		if key:
+			seen.add(key)
+		unique.append(row)
+	return unique
 
 
 def group_by_filament_id(rows):
@@ -131,23 +195,29 @@ def main():
 	base_url = args.url or input("Spoolman base URL (e.g. http://192.168.0.50:7912): ").strip()
 
 	with open(args.file, "r", encoding="utf-8") as f:
-		rows = json.load(f)
+		all_rows = json.load(f)
 
-	print(f"Loaded {len(rows)} spools from {args.file}")
+	rows = dedupe_rows(all_rows)
+	print(f"Loaded {len(all_rows)} spools from {args.file}")
+	if len(rows) != len(all_rows):
+		print(f"Ignored {len(all_rows) - len(rows)} repeated rows in the export")
 
-	# quick connectivity check before doing anything else
-	if not args.dry_run:
-		try:
-			api_request(base_url, "GET", "/api/v1/vendor")
-		except Exception as e:
+	# load current Spoolman contents; a dry run also reads them when reachable,
+	# so its output reflects what a real run would actually create
+	try:
+		vendor_ids, filament_ids, lot_nrs, spool_urls = load_existing(base_url)
+	except Exception as e:
+		if not args.dry_run:
 			print(f"Could not reach Spoolman at {base_url}: {e}")
 			sys.exit(1)
+		print(f"Could not reach Spoolman ({e}); dry run will assume it is empty")
+		vendor_ids, filament_ids, lot_nrs, spool_urls = {}, {}, set(), set()
 
-	vendor_cache = {}  # brand name -> vendor id
 	filament_cache = {}  # spooldb filament_id -> spoolman filament id
+	next_fake_id = -1  # placeholder ids handed out during a dry run
 
 	created_vendors = created_filaments = created_spools = 0
-	failed_spools = 0
+	skipped_spools = failed_spools = failed_filaments = 0
 
 	for spooldb_filament_id, group in group_by_filament_id(rows).items():
 		sample = group[0]
@@ -155,84 +225,109 @@ def main():
 		material = sample["material"].strip()
 		filament_name = build_filament_name(sample)
 
-		# resolve or create the vendor
-		if brand not in vendor_cache:
-			if args.dry_run:
-				print(f"[dry run] would ensure vendor exists: {brand}")
-				vendor_cache[brand] = -1
-			else:
-				vendor = find_vendor(base_url, brand)
-				if vendor is None:
-					vendor = create_vendor(base_url, brand)
-					created_vendors += 1
+		try:
+			# resolve or create the vendor
+			vendor_id = vendor_ids.get(norm(brand))
+			if vendor_id is None:
+				if args.dry_run:
+					print(f"[dry run] would create vendor: {brand}")
+					vendor_id = next_fake_id
+					next_fake_id -= 1
+				else:
+					vendor_id = api_request(base_url, "POST", "/api/v1/vendor", {"name": brand})["id"]
 					print(f"Created vendor: {brand}")
-				vendor_cache[brand] = vendor["id"]
-		vendor_id = vendor_cache[brand]
+				vendor_ids[norm(brand)] = vendor_id
+				created_vendors += 1
 
-		# resolve or create the filament (one per spooldb filament_id)
-		if spooldb_filament_id not in filament_cache:
-			# use the largest remaining_grams seen in the group as a stand-in for
-			# the nominal full-spool weight, since spooldb doesn't export that
-			nominal_weight = max((r.get("remaining_grams") or 0) for r in group) or 1000
+			# resolve or create the filament (one per spooldb filament_id)
+			if spooldb_filament_id not in filament_cache:
+				key = filament_key(vendor_id, material, filament_name)
+				filament_id = filament_ids.get(key)
+				if filament_id is None:
+					# use the largest remaining_grams seen in the group as a stand-in for
+					# the nominal full-spool weight, since spooldb doesn't export that
+					nominal_weight = max((r.get("remaining_grams") or 0) for r in group) or 1000
 
-			colour_hexes = [c.strip() for c in (sample.get("rgb") or "").split(",") if c.strip()]
-			filament_body = {
-				"name": filament_name,
-				"vendor_id": vendor_id,
-				"material": material,
-				"density": density_for(material),
-				"diameter": DEFAULT_DIAMETER,
-				"weight": nominal_weight,
-			}
-			if colour_hexes:
-				filament_body["color_hex"] = colour_hexes[0].lstrip("#")
-				if len(colour_hexes) > 1:
-					filament_body["multi_color_hexes"] = ",".join(c.lstrip("#") for c in colour_hexes)
+					filament_body = {
+						"name": filament_name,
+						"vendor_id": vendor_id,
+						"material": material,
+						"density": density_for(material),
+						"diameter": DEFAULT_DIAMETER,
+						"weight": nominal_weight,
+					}
+					apply_colours(filament_body, sample.get("rgb"))
 
-			if args.dry_run:
-				print(f"[dry run] would ensure filament exists: {brand} {filament_name} ({material})")
-				filament_cache[spooldb_filament_id] = -1
-			else:
-				filament = find_filament(base_url, vendor_id, material, filament_name)
-				if filament is None:
-					filament = api_request(base_url, "POST", "/api/v1/filament", filament_body)
+					if args.dry_run:
+						print(f"[dry run] would create filament: {brand} {filament_name} ({material})")
+						filament_id = next_fake_id
+						next_fake_id -= 1
+					else:
+						filament_id = api_request(base_url, "POST", "/api/v1/filament", filament_body)["id"]
+						print(f"Created filament: {brand} {filament_name} ({material})")
+					filament_ids[key] = filament_id
 					created_filaments += 1
-					print(f"Created filament: {brand} {filament_name} ({material})")
-				filament_cache[spooldb_filament_id] = filament["id"]
-		filament_id = filament_cache[spooldb_filament_id]
+				filament_cache[spooldb_filament_id] = filament_id
+			filament_id = filament_cache[spooldb_filament_id]
+
+		except RuntimeError as e:
+			# a bad vendor or filament shouldn't stop the whole import; skip its spools
+			failed_filaments += 1
+			failed_spools += len(group)
+			print(f"Failed to create {brand} {filament_name}: {e}")
+			continue
 
 		# create one Spoolman spool per spooldb spool row
 		for row in group:
+			short_code = row.get("short_code")
+			spool_url = row.get("spool_url")
+
+			# skip spools already in Spoolman
+			if (short_code and short_code in lot_nrs) or (spool_url and spool_url in spool_urls):
+				skipped_spools += 1
+				print(f"Skipped existing spool {short_code}")
+				continue
+
 			props = row.get("spool_properties") or {}
 			spool_body = {
 				"filament_id": filament_id,
 				"remaining_weight": row.get("remaining_grams"),
 				"location": row.get("location"),
-				"lot_nr": row.get("short_code"),
+				"lot_nr": short_code,
 				"comment": build_spool_comment(row),
 			}
 			if props.get("purchase_price") is not None:
 				spool_body["price"] = props["purchase_price"]
 
 			if args.dry_run:
-				print(f"[dry run] would create spool {row.get('short_code')} ({row.get('remaining_grams')}g)")
-				continue
+				print(f"[dry run] would create spool {short_code} ({row.get('remaining_grams')}g)")
+			else:
+				try:
+					api_request(base_url, "POST", "/api/v1/spool", spool_body)
+				except RuntimeError as e:
+					failed_spools += 1
+					print(f"Failed to create spool {short_code}: {e}")
+					continue
 
-			try:
-				api_request(base_url, "POST", "/api/v1/spool", spool_body)
-				created_spools += 1
-			except RuntimeError as e:
-				failed_spools += 1
-				print(f"Failed to create spool {row.get('short_code')}: {e}")
+			# record it so a repeat within this run is also caught
+			if short_code:
+				lot_nrs.add(short_code)
+			if spool_url:
+				spool_urls.add(spool_url)
+			created_spools += 1
 
+	# summary
+	prefix = "[dry run] would create" if args.dry_run else "Created"
 	print()
 	print("Done.")
-	if not args.dry_run:
-		print(f"Vendors created: {created_vendors}")
-		print(f"Filaments created: {created_filaments}")
-		print(f"Spools created: {created_spools}")
-		if failed_spools:
-			print(f"Spools failed: {failed_spools} -- see messages above")
+	print(f"{prefix} vendors: {created_vendors}")
+	print(f"{prefix} filaments: {created_filaments}")
+	print(f"{prefix} spools: {created_spools}")
+	print(f"Spools skipped (already in Spoolman): {skipped_spools}")
+	if failed_filaments:
+		print(f"Filaments failed: {failed_filaments} -- see messages above")
+	if failed_spools:
+		print(f"Spools failed: {failed_spools} -- see messages above")
 
 
 if __name__ == "__main__":
